@@ -328,14 +328,22 @@ class CognihakRuntime(HarnessProvider):
             if payload.get("kind", "content") == "content" and delta:
                 return StreamItem("chunk", {"text": delta})
             return None
+        if etype == "assistant/message":
+            # cognihak may emit a complete message without chunked deltas
+            # (e.g. compaction output, summarization). Surface it as a single
+            # chunk so derive_messages() sees the text instead of an empty
+            # assistant message.
+            text = payload.get("text") or payload.get("content") or ""
+            if text:
+                return StreamItem("chunk", {"text": text})
+            return None
         if etype == "step/end" and payload.get("status") == "error":
             raise HarnessError(
                 "RUNTIME_FAULT",
                 f"cognihak step failed: {payload.get('error', 'unknown')}",
             )
-        # assistant/message, turn/*, step boundaries, tool events: the host
-        # derives its own facts from the chunks; cognihak's internals stay its
-        # own.
+        # turn/*, step boundaries, tool events: the host derives its own
+        # facts from the chunks; cognihak's internals stay its own.
         return None
 
     def cancel(self):

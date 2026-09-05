@@ -41,11 +41,11 @@ class BoundedEventBuffer:
         return "ok", 0
 
     def resume(self):
-        """Consumer drains; explicit-resume releases a paused buffer."""
+        """Consumer-driven resume: release the pause flag without touching
+        the queue. Any items already buffered survive; the caller drains
+        them via drain(). pause is lossless by contract."""
         if self._paused:
             self._paused = False
-            while self._queue:
-                self._queue.popleft()
             return "resumed"
         return "idle"
 

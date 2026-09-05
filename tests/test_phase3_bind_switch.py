@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dmh.child_runtime import ChildRuntime
 from dmh.errors import HarnessError
 from dmh.host import Host
-from dmh.native import ScriptedNative
+from dmh.native import ScriptedNative, NATIVE_CAPABILITIES
+from dmh.provider import HarnessProvider, StreamItem
 
 
 def build_host(store, policy=None):
@@ -93,6 +94,130 @@ class Phase3BindSwitchTests(unittest.TestCase):
         self.assertEqual(len(step_ids), len(set(step_ids)))
         self.assertTrue(step_ids[0].startswith("native:"))
         self.assertTrue(step_ids[-1].startswith("child:"))
+        host.stop_all()
+
+    def test_switch_runtime_log_records_unbind_and_switch_before_old_stop(self):
+        """Contract: log claims the new binding before transport tear-down.
+        When the outgoing provider's stop() runs, the session log already
+        contains runtime/unbind, runtime/switch, and the incoming bind events."""
+
+        class SlowStopProvider(HarnessProvider):
+            runtime_id = "slowstop"
+
+            def __init__(self, runtime_id, log_ref):
+                self._rid = runtime_id
+                self._log_ref = log_ref
+                self.stop_snapshot = None
+
+            def capabilities(self):
+                return dict(NATIVE_CAPABILITIES)
+
+            def initialize(self, host_caps, constraints):
+                return {
+                    "abiVersion": 2,
+                    "runtimeInfo": {"name": self._rid, "version": "0.0", "vendor": "test"},
+                    "runtimeCapabilities": dict(NATIVE_CAPABILITIES),
+                    "schemaHash": self.schema_hash(),
+                }
+
+            def configure(self, snapshot):
+                pass
+
+            def open_turn(self, epoch, projection):
+                pass
+
+            def run_step(self, resume=None):
+                yield StreamItem("chunk", {"text": "ok"})
+                yield StreamItem("step_end", {"turn_end": True})
+
+            def cancel(self):
+                pass
+
+            def stop(self):
+                # Snapshot what the log looks like at the moment old.stop runs.
+                self.stop_snapshot = [e.kind for e in self._log_ref.events]
+
+        host = build_host(self.tmp)
+        host.register(
+            "slow_a",
+            lambda: SlowStopProvider("slow_a", host.sessions.get(next(iter(host.sessions)), None) or None),
+        )
+
+        # Build a host whose session we have a handle to. We'll bind slow_a
+        # to a session created first, then register slow_b with a snapshot
+        # back-pointer updated after bind.
+
+        # Simpler: hold the session and rewrite the snapshot via a class
+        # attribute updater.
+
+        builder = {"log_ref": None}
+
+        class SlowStopWithLog(HarnessProvider):
+            runtime_id = "slowlog"
+
+            def __init__(self):
+                self.stop_snapshot = None
+
+            def capabilities(self):
+                return dict(NATIVE_CAPABILITIES)
+
+            def initialize(self, host_caps, constraints):
+                return {
+                    "abiVersion": 2,
+                    "runtimeInfo": {"name": self.__class__.__name__},
+                    "runtimeCapabilities": dict(NATIVE_CAPABILITIES),
+                    "schemaHash": self.schema_hash(),
+                }
+
+            def configure(self, snapshot):
+                pass
+
+            def open_turn(self, epoch, projection):
+                pass
+
+            def run_step(self, resume=None):
+                yield StreamItem("chunk", {"text": "ok"})
+                yield StreamItem("step_end", {"turn_end": True})
+
+            def cancel(self):
+                pass
+
+            def stop(self):
+                self.stop_snapshot = [e.kind for e in builder["log_ref"].events]
+
+        host.register("ss_a", lambda: SlowStopWithLog())
+        host.register("ss_b", lambda: SlowStopWithLog())
+
+        s = host.create_session("default")
+        builder["log_ref"] = s.log
+        s.bind("ss_a")
+        s.submit("first")
+        ss_a = s.provider
+
+        s.switch_runtime("ss_b", reason="specialist")
+        ss_b = s.provider
+
+        # Old provider's stop() was called during switch_runtime; we asked
+        # it to record what the log looked like at that moment.
+        snapshot_at_old_stop = ss_a.stop_snapshot
+        self.assertIsNotNone(
+            snapshot_at_old_stop,
+            "old provider's stop() must have run during switch_runtime",
+        )
+        # At the moment old.stop runs, the log must already show the new
+        # unbind, new switch, and the new runtime/bind events.
+        self.assertIn("runtime/unbind", snapshot_at_old_stop)
+        self.assertIn("runtime/switch", snapshot_at_old_stop)
+        bind_indices = [
+            i for i, k in enumerate(snapshot_at_old_stop) if k == "runtime/bind"
+        ]
+        self.assertEqual(
+            len(bind_indices), 2,
+            "expected two runtime/bind events (initial + new) at old.stop time",
+        )
+        switch_index = snapshot_at_old_stop.index("runtime/switch")
+        # Order: switch precedes the *new* (last) bind in the snapshot.
+        self.assertLess(switch_index, bind_indices[-1])
         host.stop_all()
 
     def test_switch_requires_replay_from_log(self):
