@@ -298,6 +298,11 @@ class Session:
         self.provider.open_turn(self.epoch, projection)
         aborted = None
         resume = None
+        # Track how we leave the step loop so the right terminal fact lands
+        # on the log. for-else: the else clause only fires when the loop
+        # completes without break - i.e. MAX_STEPS_PER_TURN was hit and no
+        # step ever set turn_end / abort / error.
+        exhausted = False
         try:
             for step_no in range(1, MAX_STEPS_PER_TURN + 1):
                 step_id = f"{self.runtime_id}:{self.id}:{step_no}"
@@ -347,10 +352,18 @@ class Session:
                     break
                 if turn_end:
                     break
-            self.log.append("turn/end", {
-                "turn": self.turn_no, "epoch": self.epoch,
-                "status": "aborted" if aborted else "ok",
-            }, self.runtime_id, self.epoch)
+            else:
+                exhausted = True
+            if exhausted:
+                self.log.append("turn/abort", {
+                    "turn": self.turn_no,
+                    "reason": "max_steps_exceeded",
+                }, self.runtime_id, self.epoch)
+            else:
+                self.log.append("turn/end", {
+                    "turn": self.turn_no, "epoch": self.epoch,
+                    "status": "aborted" if aborted else "ok",
+                }, self.runtime_id, self.epoch)
         finally:
             self.turn_open = False
 

@@ -109,6 +109,23 @@ class Phase8CognihakRuntimeTests(unittest.TestCase):
         self.assertEqual(len(assistants), 2)
         host.stop_all()
 
+    def test_translate_surfaces_assistant_message_as_chunk(self):
+        """Regression: cognihak may emit assistant/message directly (no
+        preceding assistant/chunk events - e.g. summarization, tool-only
+        compressed responses). Until _translate is taught to handle that
+        event type, the host silently loses the text and derive_messages()
+        sees no assistant content."""
+        runtime = self.build_runtime()
+        item = runtime._translate({
+            "type": "assistant/message",
+            "payload": {"text": "fallback text"},
+        })
+        self.assertIsNotNone(
+            item, "assistant/message must surface; today _translate returns None"
+        )
+        self.assertEqual(item.kind, "chunk")
+        self.assertEqual(item.payload["text"], "fallback text")
+
     def test_stop_terminates_the_child(self):
         runtime = self.build_runtime()
         runtime.launch()
