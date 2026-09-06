@@ -6,6 +6,7 @@ style core with OpenTofu-style replaceable runtime providers.
 """
 
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -156,16 +157,18 @@ class Session:
         self._sink = None
         self._buffer = None
         self._pending_tool = None
+        self._lock = threading.RLock()
 
     # ---- bind / rebind ----
     def bind(self, runtime_id, reason="initial", extra_required=()):
         """Fail-loud bind: launch, handshake, initialize, capability gate."""
-        events = self._bind(runtime_id, reason, extra_required)
-        for kind, payload, rt, epoch in events:
-            self.log.append(kind, payload, runtime_id=rt, epoch=epoch)
-        failure = [e for e in events if e[0] == "runtime/bind-failed"]
-        if failure:
-            raise HarnessError(failure[0][1]["errorCode"], failure[0][1]["message"])
+        with self._lock:
+            events = self._bind(runtime_id, reason, extra_required)
+            for kind, payload, rt, epoch in events:
+                self.log.append(kind, payload, runtime_id=rt, epoch=epoch)
+            failure = [e for e in events if e[0] == "runtime/bind-failed"]
+            if failure:
+                raise HarnessError(failure[0][1]["errorCode"], failure[0][1]["message"])
 
     def _bind(self, runtime_id, reason, extra_required):
         spec = self.host.runtimes.get(runtime_id)
@@ -248,124 +251,127 @@ class Session:
     def switch_runtime(self, to, reason):
         """Per-turn rebind. Legal only at turn boundaries; requires
         replay.from_log on the incoming runtime. Never mid-stream."""
-        if self.turn_open:
-            raise HarnessError(
-                "TURN_OPEN", "runtime/switch is illegal with an open turn"
-            )
-        if self.runtime_id is None:
-            raise HarnessError("RUNTIME_FAULT", "no runtime bound to switch from")
-        old_provider = self.provider
-        old_runtime = self.runtime_id
-        events = self._bind(to, "switch", extra_required=("replay.from_log",))
-        failure = [e for e in events if e[0] == "runtime/bind-failed"]
-        if failure:
+        with self._lock:
+            if self.turn_open:
+                raise HarnessError(
+                    "TURN_OPEN", "runtime/switch is illegal with an open turn"
+                )
+            if self.runtime_id is None:
+                raise HarnessError("RUNTIME_FAULT", "no runtime bound to switch from")
+            old_provider = self.provider
+            old_runtime = self.runtime_id
+            events = self._bind(to, "switch", extra_required=("replay.from_log",))
+            failure = [e for e in events if e[0] == "runtime/bind-failed"]
+            if failure:
+                for kind, payload, rt, epoch in events:
+                    self.log.append(kind, payload, runtime_id=rt, epoch=epoch)
+                raise HarnessError(
+                    failure[0][1]["errorCode"], failure[0][1]["message"]
+                )
+            self.epoch += 1
+            self.log.append("runtime/unbind", {"runtime": old_runtime, "reason": reason},
+                            runtime_id=old_runtime, epoch=self.epoch)
+            self.log.append("runtime/switch", {
+                "from": old_runtime, "to": to, "reason": reason, "epoch": self.epoch,
+            }, None, self.epoch)
             for kind, payload, rt, epoch in events:
-                self.log.append(kind, payload, runtime_id=rt, epoch=epoch)
-            raise HarnessError(
-                failure[0][1]["errorCode"], failure[0][1]["message"]
-            )
-        self.epoch += 1
-        self.log.append("runtime/unbind", {"runtime": old_runtime, "reason": reason},
-                        runtime_id=old_runtime, epoch=self.epoch)
-        self.log.append("runtime/switch", {
-            "from": old_runtime, "to": to, "reason": reason, "epoch": self.epoch,
-        }, None, self.epoch)
-        for kind, payload, rt, epoch in events:
-            self.log.append(kind, payload, runtime_id=rt, epoch=self.epoch)
-        try:
-            old_provider.stop()
-        except HarnessError:
-            pass
+                self.log.append(kind, payload, runtime_id=rt, epoch=self.epoch)
+            try:
+                old_provider.stop()
+            except HarnessError:
+                pass
 
 
     # ---- turn lifecycle ----
     def submit(self, text):
         """Inbox injection: a user/message fact, then a governed turn."""
-        if self.provider is None:
-            raise HarnessError("RUNTIME_FAULT", "session is not bound to a runtime")
-        self.log.append("user/message", {"text": text}, runtime_id=None, epoch=self.epoch)
-        self.run_turn()
+        with self._lock:
+            if self.provider is None:
+                raise HarnessError("RUNTIME_FAULT", "session is not bound to a runtime")
+            self.log.append("user/message", {"text": text}, runtime_id=None, epoch=self.epoch)
+            self.run_turn()
 
     def run_turn(self):
-        if self.turn_open:
-            raise HarnessError("TURN_OPEN", "turn already in progress")
-        self.turn_open = True
-        self.turn_no += 1
-        self.log.append("turn/start", {
-            "turn": self.turn_no, "epoch": self.epoch,
-        }, None, self.epoch)
-        projection = self.log.derive_messages()
-        self.provider.open_turn(self.epoch, projection)
-        aborted = None
-        resume = None
-        # Track how we leave the step loop so the right terminal fact lands
-        # on the log. for-else: the else clause only fires when the loop
-        # completes without break - i.e. MAX_STEPS_PER_TURN was hit and no
-        # step ever set turn_end / abort / error.
-        exhausted = False
-        try:
-            for step_no in range(1, MAX_STEPS_PER_TURN + 1):
-                step_id = f"{self.runtime_id}:{self.id}:{step_no}"
-                self.log.append("step/start", {
-                    "step_id": step_id, "schema_hash": self.provider.schema_hash(),
-                }, self.runtime_id, self.epoch)
-                chunks = []
-                turn_end = False
-                error = None
-                for item in self.provider.run_step(resume=resume):
-                    if item.kind == "chunk":
-                        self.log.append("assistant/chunk", {"text": item.payload["text"]},
-                                        runtime_id=self.runtime_id, epoch=self.epoch)
-                        chunks.append(item.payload["text"])
-                        self._push_sink("assistant/chunk", item.payload["text"])
-                    elif item.kind == "tool_call":
-                        resume = self._handle_tool_call(item.payload)
-                        if chunks:
-                            self.log.append("assistant/message", {"text": "".join(chunks)},
+        with self._lock:
+            if self.turn_open:
+                raise HarnessError("TURN_OPEN", "turn already in progress")
+            self.turn_open = True
+            self.turn_no += 1
+            self.log.append("turn/start", {
+                "turn": self.turn_no, "epoch": self.epoch,
+            }, None, self.epoch)
+            projection = self.log.derive_messages()
+            self.provider.open_turn(self.epoch, projection)
+            aborted = None
+            resume = None
+            # Track how we leave the step loop so the right terminal fact lands
+            # on the log. for-else: the else clause only fires when the loop
+            # completes without break - i.e. MAX_STEPS_PER_TURN was hit and no
+            # step ever set turn_end / abort / error.
+            exhausted = False
+            try:
+                for step_no in range(1, MAX_STEPS_PER_TURN + 1):
+                    step_id = f"{self.runtime_id}:{self.id}:{step_no}"
+                    self.log.append("step/start", {
+                        "step_id": step_id, "schema_hash": self.provider.schema_hash(),
+                    }, self.runtime_id, self.epoch)
+                    chunks = []
+                    turn_end = False
+                    error = None
+                    for item in self.provider.run_step(resume=resume):
+                        if item.kind == "chunk":
+                            self.log.append("assistant/chunk", {"text": item.payload["text"]},
                                             runtime_id=self.runtime_id, epoch=self.epoch)
-                            chunks = []
-                    elif item.kind == "step_end":
-                        turn_end = bool(item.payload.get("turn_end"))
-                        aborted = item.payload.get("aborted")
-                        error = item.payload.get("error")
-                if chunks:
-                    self.log.append("assistant/message", {"text": "".join(chunks)},
-                                    runtime_id=self.runtime_id, epoch=self.epoch)
-                self.log.append("step/end", {
-                    "step_id": step_id,
-                    "status": "aborted" if aborted else ("error" if error else "ok"),
-                }, self.runtime_id, self.epoch)
-                if aborted == "before_dispatch":
-                    self.log.append("turn/abort-before-dispatch", {
+                            chunks.append(item.payload["text"])
+                            self._push_sink("assistant/chunk", item.payload["text"])
+                        elif item.kind == "tool_call":
+                            resume = self._handle_tool_call(item.payload)
+                            if chunks:
+                                self.log.append("assistant/message", {"text": "".join(chunks)},
+                                                runtime_id=self.runtime_id, epoch=self.epoch)
+                                chunks = []
+                        elif item.kind == "step_end":
+                            turn_end = bool(item.payload.get("turn_end"))
+                            aborted = item.payload.get("aborted")
+                            error = item.payload.get("error")
+                    if chunks:
+                        self.log.append("assistant/message", {"text": "".join(chunks)},
+                                        runtime_id=self.runtime_id, epoch=self.epoch)
+                    self.log.append("step/end", {
+                        "step_id": step_id,
+                        "status": "aborted" if aborted else ("error" if error else "ok"),
+                    }, self.runtime_id, self.epoch)
+                    if aborted == "before_dispatch":
+                        self.log.append("turn/abort-before-dispatch", {
+                            "turn": self.turn_no,
+                        }, self.runtime_id, self.epoch)
+                        break
+                    if aborted == "drained":
+                        self.log.append("turn/abort", {
+                            "turn": self.turn_no, "reason": "cancelled mid-stream, drained",
+                        }, self.runtime_id, self.epoch)
+                        break
+                    if error:
+                        self.log.append("turn/abort", {
+                            "turn": self.turn_no, "reason": error,
+                        }, self.runtime_id, self.epoch)
+                        break
+                    if turn_end:
+                        break
+                else:
+                    exhausted = True
+                if exhausted:
+                    self.log.append("turn/abort", {
                         "turn": self.turn_no,
+                        "reason": "max_steps_exceeded",
                     }, self.runtime_id, self.epoch)
-                    break
-                if aborted == "drained":
-                    self.log.append("turn/abort", {
-                        "turn": self.turn_no, "reason": "cancelled mid-stream, drained",
+                else:
+                    self.log.append("turn/end", {
+                        "turn": self.turn_no, "epoch": self.epoch,
+                        "status": "aborted" if aborted else "ok",
                     }, self.runtime_id, self.epoch)
-                    break
-                if error:
-                    self.log.append("turn/abort", {
-                        "turn": self.turn_no, "reason": error,
-                    }, self.runtime_id, self.epoch)
-                    break
-                if turn_end:
-                    break
-            else:
-                exhausted = True
-            if exhausted:
-                self.log.append("turn/abort", {
-                    "turn": self.turn_no,
-                    "reason": "max_steps_exceeded",
-                }, self.runtime_id, self.epoch)
-            else:
-                self.log.append("turn/end", {
-                    "turn": self.turn_no, "epoch": self.epoch,
-                    "status": "aborted" if aborted else "ok",
-                }, self.runtime_id, self.epoch)
-        finally:
-            self.turn_open = False
+            finally:
+                self.turn_open = False
 
 
 
@@ -421,53 +427,55 @@ class Session:
     def delegate_harness(self, runtime_id, objective):
         """One tool that opens a child session: lineage = parent,
         delegation_depth += 1, results come back as tool/result."""
-        self.log.append("tool/call", {
-            "tool": "delegate_harness",
-            "args": {"runtime": runtime_id, "objective": objective},
-            "schema_hash": self.provider.schema_hash() if self.provider else "",
-        }, self.runtime_id, self.epoch)
-        if self.delegation_depth >= MAX_DELEGATION_DEPTH:
-            self.log.append("tool/result", {
-                "tool": "delegate_harness", "status": "refused",
-                "content": "DELEGATION_DEPTH_EXCEEDED",
+        with self._lock:
+            self.log.append("tool/call", {
+                "tool": "delegate_harness",
+                "args": {"runtime": runtime_id, "objective": objective},
+                "schema_hash": self.provider.schema_hash() if self.provider else "",
             }, self.runtime_id, self.epoch)
-            return None
-        child = self.host.create_session(
-            preset=self.preset,
-            parent_id=self.id,
-            delegation_depth=self.delegation_depth + 1,
-        )
-        child.bind(runtime_id)
-        child.submit(objective)
-        output = child.log.last_assistant_text()
-        self.log.append("session/delegate", {
-            "parent": self.id, "child": child.id,
-            "depth": child.delegation_depth,
-        }, self.runtime_id, self.epoch)
-        self.log.append("tool/result", {
-            "tool": "delegate_harness", "status": "ok",
-            "child_session": child.id, "content": output,
-        }, self.runtime_id, self.epoch)
-        return child
+            if self.delegation_depth >= MAX_DELEGATION_DEPTH:
+                self.log.append("tool/result", {
+                    "tool": "delegate_harness", "status": "refused",
+                    "content": "DELEGATION_DEPTH_EXCEEDED",
+                }, self.runtime_id, self.epoch)
+                return None
+            child = self.host.create_session(
+                preset=self.preset,
+                parent_id=self.id,
+                delegation_depth=self.delegation_depth + 1,
+            )
+            child.bind(runtime_id)
+            child.submit(objective)
+            output = child.log.last_assistant_text()
+            self.log.append("session/delegate", {
+                "parent": self.id, "child": child.id,
+                "depth": child.delegation_depth,
+            }, self.runtime_id, self.epoch)
+            self.log.append("tool/result", {
+                "tool": "delegate_harness", "status": "ok",
+                "child_session": child.id, "content": output,
+            }, self.runtime_id, self.epoch)
+            return child
 
     def unbind(self, reason="shutdown"):
         """Unbind the current runtime: stop the provider, append runtime/unbind,
         close the session log. Idempotent — safe to call on an already-unbound
         or already-shut-down session."""
-        if self.provider is not None:
-            try:
-                self.log.append("runtime/unbind", {
-                    "runtime": self.runtime_id, "reason": reason,
-                }, runtime_id=self.runtime_id, epoch=self.epoch)
-            except HarnessError:
-                pass  # log may already be closed; that is fine
-            try:
-                self.provider.stop()
-            except HarnessError:
-                pass
-            self.provider = None
-            self.runtime_id = None
-        self.log.close()
+        with self._lock:
+            if self.provider is not None:
+                try:
+                    self.log.append("runtime/unbind", {
+                        "runtime": self.runtime_id, "reason": reason,
+                    }, runtime_id=self.runtime_id, epoch=self.epoch)
+                except HarnessError:
+                    pass  # log may already be closed; that is fine
+                try:
+                    self.provider.stop()
+                except HarnessError:
+                    pass
+                self.provider = None
+                self.runtime_id = None
+            self.log.close()
 
     # ---- cancellation / shutdown ----
     def cancel(self):

@@ -9,6 +9,7 @@ from .errors import HarnessError
 from .provider import HarnessProvider, StreamItem
 from .capabilities import effective as effective_capabilities
 from .host import Host, RuntimeSpec
+from . import ev1h_runtime, cognihak_runtime, qwen_runtime
 
 __version__ = "0.1.0"
 
@@ -19,4 +20,8 @@ __all__ = [
     "RuntimeSpec",
     "StreamItem",
     "effective_capabilities",
+    "ev1h_runtime",
+    "cognihak_runtime",
+    "qwen_runtime",
 ]
+
