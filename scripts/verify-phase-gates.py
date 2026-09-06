@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the eight named phase gates, fail-loud (SGAA-style).
+"""Verify the nine named phase gates, fail-loud (SGAA-style).
 
 Each gate maps to a named test module:
   1 kernel      tests/test_phase1_log.py
@@ -10,8 +10,9 @@ Each gate maps to a named test module:
   6 flow/cancel tests/test_phase6_flow.py
   7 foreign     tests/test_phase7_ev1h.py
   8 translator  tests/test_phase8_cognihak.py
+  9 qwen        tests/test_phase9_qwen.py
 
-Gates 7 and 8 drive real foreign harnesses living in other repos. They skip -
+Gates 7, 8, and 9 drive real foreign harnesses living in other repos. They skip -
 and report GREEN - when that checkout is absent, so the gate stays runnable on
 a machine that only has this one.
 """
@@ -30,6 +31,7 @@ GATES = [
     ("6 Flow & Cancel", "tests.test_phase6_flow"),
     ("7 Foreign Runtime", "tests.test_phase7_ev1h"),
     ("8 Translator Runtime", "tests.test_phase8_cognihak"),
+    ("9 Qwen Runtime", "tests.test_phase9_qwen"),
 ]
 
 

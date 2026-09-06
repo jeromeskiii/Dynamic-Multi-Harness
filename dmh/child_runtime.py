@@ -196,11 +196,7 @@ class ChildRuntime(HarnessProvider):
                 self.proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except OSError:
-                pass
+        self._close_streams()
 
     # ---- JSON-RPC over the child stream ----
     def rpc(self, method, params=None, timeout=10.0, timeout_code="RUNTIME_FAULT"):

@@ -11,3 +11,6 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["dmh*"]
+
+[tool.setuptools.package-data]
+dmh = ["py.typed"]

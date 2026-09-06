@@ -1,15 +1,13 @@
-"""Host-side adapter: spawn cognihak and translate onto its own protocol.
+"""Host-side adapter: spawn Qwen3.8-Flash-Next-Harness and translate onto its protocol.
 
-cognihak already speaks newline-delimited JSON-RPC over stdio, but with its
-own method set (``session/*``, ``agent/*``, ``shutdown``) and its own async
-semantics: ``agent/send`` returns ``{ok: true}`` immediately and the turn
-unfolds in a session log you poll. So this provider does not speak the DMH
-ABI to the child - it *translates*, driving one protocol from the other:
+Qwen3.8-Flash-Next-Harness speaks newline-delimited JSON-RPC over stdio, with
+the H1 method set (``session/*``, ``agent/*``, ``shutdown``). This provider
+translates DMH ABI provider calls into the Qwen harness JSON-RPC protocol:
 
-    DMH ABI                          cognihak protocol
-    --------                         -----------------
-    launch                           spawn ``cog --profile protocol``
-    initialize                       session/list (liveness) + session/create
+    DMH ABI                          Qwen harness protocol
+    --------                         ---------------------
+    launch                           spawn ``dsh --profile protocol``
+    initialize                       session/list (liveness + session ID discovery)
     open_turn(epoch, projection)     remember the projection
     step/run                         agent/send, then poll session/events
       step/chunk                       assistant/chunk delta
@@ -17,17 +15,9 @@ ABI to the child - it *translates*, driving one protocol from the other:
     cancel                           boundary flag only - no agent/cancel
     shutdown                         shutdown + close stdin
 
-The translation is the honest part. The DMH ABI assumes the runtime can
-rebuild itself from the host's log projection; cognihak's protocol has no
-way to inject history (``agent/send`` takes only a message), so this runtime
-declares ``replay.from_log: false``. The host enforces that claim:
-``switch_runtime`` requires ``replay.from_log``, so a session can *bind*
-cognihak but cannot *switch to* it mid-session. That is fail-closed by
-design, not a defect to be configured away.
-
-One session per bind, created fresh. Context across turns accumulates in
-cognihak's own log, which is runtime state the host does not reconstruct -
-the mirror image of the host never seeing cognihak's internals.
+Like cognihak, Qwen3.8-Flash-Next-Harness does not accept history injection
+on agent/send, so this runtime declares ``replay.from_log: false``.
+Switching out is allowed; switching into mid-session fails closed.
 """
 
 import json
@@ -41,7 +31,7 @@ from .provider import HarnessProvider, StreamItem, compute_schema_hash
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 
-COGNIHAK_CAPABILITIES = {
+QWEN_CAPABILITIES = {
     "streaming": True,
     "replay.from_log": False,
     "tools.native": False,
@@ -62,19 +52,16 @@ BOOT_TIMEOUT = 35.0
 STEP_TIMEOUT = 60.0
 POLL_INTERVAL = 0.05
 
-# Ambient environment the child never sees. The spawn gets a minimal allowlist
-# plus the explicit COG_* seam - same discipline as hs.child_env, applied to a
-# runtime that does not speak the handshake protocol.
 BASE_ENV_KEYS = ("PATH", "HOME", "TMPDIR")
 
 
 def resolve_project_root(project_root=None):
     if project_root is not None:
         return str(Path(project_root).resolve())
-    env_root = os.environ.get("COGNIHAK_ROOT")
+    env_root = os.environ.get("QWEN_ROOT")
     if env_root:
         return str(Path(env_root).resolve())
-    default = Path(__file__).resolve().parents[1] / ".." / "cognihak"
+    default = Path(__file__).resolve().parents[1] / ".." / "Qwen3.8-Flash-Next-Harness"
     return str(default.resolve())
 
 
@@ -85,7 +72,7 @@ def resolve_entry(root):
 def resolve_tsx(root, tsx=None):
     if tsx is not None:
         return tsx
-    env_tsx = os.environ.get("COGNIHAK_TSX")
+    env_tsx = os.environ.get("QWEN_TSX")
     if env_tsx:
         return env_tsx
     local = os.path.join(root, "node_modules", ".bin", "tsx")
@@ -95,8 +82,7 @@ def resolve_tsx(root, tsx=None):
 
 
 def available(tsx=None, project_root=None):
-    """Whether a bind can even be attempted. Callers gate on this rather than
-    re-deriving the paths, so one resolution rule decides both."""
+    """Whether a bind can even be attempted."""
     root = resolve_project_root(project_root)
     entry = resolve_entry(root)
     interpreter = resolve_tsx(root, tsx)
@@ -106,10 +92,10 @@ def available(tsx=None, project_root=None):
     return os.path.isfile(entry)
 
 
-class CognihakRuntime(HarnessProvider):
-    """The cognihak harness as a provider, through its own stdio protocol."""
+class QwenRuntime(HarnessProvider):
+    """The Qwen3.8-Flash-Next harness as a provider, through its stdio protocol."""
 
-    runtime_id = "cognihak"
+    runtime_id = "qwen3.8-flash-next"
 
     def __init__(self, *, tsx=None, project_root=None, env=None,
                  api_base=None, api_key=None, persistence_root=None,
@@ -118,8 +104,8 @@ class CognihakRuntime(HarnessProvider):
         self._entry = resolve_entry(self._root)
         self._tsx = resolve_tsx(self._root, tsx)
         self._env = dict(env or {})
-        self._api_base = api_base or os.environ.get("COG_API_BASE")
-        self._api_key = api_key or os.environ.get("COG_API_KEY")
+        self._api_base = api_base or os.environ.get("QSH_API_BASE")
+        self._api_key = api_key or os.environ.get("QSH_API_KEY")
         self._persistence_root = persistence_root
         self._profile = profile
         self._step_timeout = step_timeout
@@ -140,11 +126,11 @@ class CognihakRuntime(HarnessProvider):
             if key in os.environ:
                 env[key] = os.environ[key]
         if self._api_base:
-            env["COG_API_BASE"] = self._api_base
+            env["QSH_API_BASE"] = self._api_base
         if self._api_key:
-            env["COG_API_KEY"] = self._api_key
+            env["QSH_API_KEY"] = self._api_key
         if self._persistence_root:
-            env["COG_PERSISTENCE_ROOT"] = self._persistence_root
+            env["DSH_PERSISTENCE_ROOT"] = self._persistence_root
         for key, value in self._env.items():
             if "TOKEN" in key or "SECRET" in key or "KEY" in key:
                 raise HarnessError(
@@ -161,7 +147,7 @@ class CognihakRuntime(HarnessProvider):
         if not os.path.isfile(self._entry):
             raise HarnessError(
                 "RUNTIME_FAULT",
-                f"cognihak entrypoint missing: {self._entry}",
+                f"Qwen entrypoint missing: {self._entry}",
                 {"root": self._root},
             )
         argv = [self._tsx, self._entry, "--profile", self._profile]
@@ -172,14 +158,14 @@ class CognihakRuntime(HarnessProvider):
         )
         return {
             "runtime_id": self.runtime_id,
-            "transport": "stdio+cognihak-jsonrpc",
+            "transport": "stdio+qwen-jsonrpc",
             "entry": self._entry,
         }
 
     def _rpc(self, method, params=None, timeout=10.0):
         if self.proc is None or self.proc.poll() is not None:
             raise HarnessError(
-                "RUNTIME_FAULT", "cognihak process is gone"
+                "RUNTIME_FAULT", "Qwen harness process is gone"
             )
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -220,7 +206,7 @@ class CognihakRuntime(HarnessProvider):
     def _raise_gone(self):
         tail = self._stderr_tail()
         raise HarnessError(
-            "RUNTIME_FAULT", "cognihak closed the stream", {"stderr_tail": tail}
+            "RUNTIME_FAULT", "Qwen harness closed the stream", {"stderr_tail": tail}
         )
 
     def _stderr_tail(self):
@@ -234,40 +220,37 @@ class CognihakRuntime(HarnessProvider):
     # ---- provider contract ----
 
     def capabilities(self):
-        return dict(COGNIHAK_CAPABILITIES)
+        return dict(QWEN_CAPABILITIES)
 
     def initialize(self, host_caps, constraints):
-        # session/list doubles as the boot probe: the kernel has a 30s
-        # per-plugin boot deadline, and this is how we wait it out.
         deadline = time.monotonic() + BOOT_TIMEOUT
         while True:
             try:
-                self._rpc("session/list", {}, timeout=5.0)
+                sessions = self._rpc("session/list", {}, timeout=5.0)
+                if sessions and isinstance(sessions, list):
+                    self.session_id = sessions[0]
+                else:
+                    self.session_id = f"qwen-{time.time_ns()}"
                 break
             except HarnessError as exc:
                 if time.monotonic() >= deadline:
                     raise HarnessError(
                         "RUNTIME_FAULT",
-                        f"cognihak did not become ready: {exc.message}",
+                        f"Qwen harness did not become ready: {exc.message}",
                         exc.data,
                     ) from None
                 time.sleep(0.1)
-        result = self._rpc("session/create", {}, timeout=BOOT_TIMEOUT)
-        self.session_id = (result or {}).get("sessionId")
-        if not self.session_id:
-            raise HarnessError(
-                "RUNTIME_FAULT", "session/create returned no sessionId"
-            )
+
         return {
             "abiVersion": 2,
             "runtimeInfo": {
-                "name": "cognihak",
+                "name": "qwen3.8-flash-next",
                 "version": "0.1.0",
-                "vendor": "cognihak",
-                "protocol": "cognihak-jsonrpc-stdio",
+                "vendor": "qwen",
+                "protocol": "qwen-jsonrpc-stdio",
                 "digest": None,
             },
-            "runtimeCapabilities": dict(COGNIHAK_CAPABILITIES),
+            "runtimeCapabilities": dict(QWEN_CAPABILITIES),
             "authMethods": [],
             "schemaHash": self.schema_hash(),
         }
@@ -281,8 +264,6 @@ class CognihakRuntime(HarnessProvider):
 
     def run_step(self, resume=None):
         if self._cancel:
-            # No agent/cancel exists on the protocol carrier, so cancellation
-            # is observable at step boundaries only.
             self._cancel = False
             yield StreamItem("step_end", {"turn_end": False, "aborted": "before_dispatch"})
             return
@@ -329,10 +310,6 @@ class CognihakRuntime(HarnessProvider):
                 return StreamItem("chunk", {"text": delta})
             return None
         if etype == "assistant/message":
-            # cognihak may emit a complete message without chunked deltas
-            # (e.g. compaction output, summarization). Surface it as a single
-            # chunk so derive_messages() sees the text instead of an empty
-            # assistant message.
             text = payload.get("text") or payload.get("content") or ""
             if text:
                 return StreamItem("chunk", {"text": text})
@@ -340,10 +317,8 @@ class CognihakRuntime(HarnessProvider):
         if etype == "step/end" and payload.get("status") == "error":
             raise HarnessError(
                 "RUNTIME_FAULT",
-                f"cognihak step failed: {payload.get('error', 'unknown')}",
+                f"Qwen harness step failed: {payload.get('error', 'unknown')}",
             )
-        # turn/*, step boundaries, tool events: the host derives its own
-        # facts from the chunks; cognihak's internals stay its own.
         return None
 
     def cancel(self):
@@ -393,10 +368,10 @@ class CognihakRuntime(HarnessProvider):
         return ""
 
 
-def register(host, runtime_id="cognihak", **kwargs):
-    """Register CognihakRuntime with a host. Convenience for host.register()."""
+def register(host, runtime_id="qwen3.8-flash-next", **kwargs):
+    """Register QwenRuntime with a host. Convenience for host.register()."""
     host.register(
         runtime_id,
-        lambda: CognihakRuntime(**kwargs),
-        declared_caps=COGNIHAK_CAPABILITIES,
+        lambda: QwenRuntime(**kwargs),
+        declared_caps=QWEN_CAPABILITIES,
     )
