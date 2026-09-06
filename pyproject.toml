@@ -9,6 +9,9 @@ description = "A host that owns authoritative session state and swaps replaceabl
 requires-python = ">=3.9"
 dependencies = []
 
+[project.scripts]
+dmh = "dmh.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["dmh*"]
 

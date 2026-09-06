@@ -6,6 +6,8 @@ style core with OpenTofu-style replaceable runtime providers.
 """
 
 import os
+import signal
+import sys
 import threading
 import time
 import uuid
@@ -16,8 +18,10 @@ from .capabilities import HOST_CAPABILITIES
 from .errors import HarnessError
 from .events import SessionLog
 from .handshake import redact
+from .persistence import SessionMetadata, SessionStore
 from .presets import preset_requires
 from .provider import HarnessProvider
+from .telemetry import default_logger
 
 
 class SandboxWorld:
@@ -106,11 +110,13 @@ class Host:
     the session log."""
 
     def __init__(self, store_dir=".dmh_state", approval_policy=None,
-                 sandbox_root=None):
+                 sandbox_root=None, logger=None):
         self.store_dir = os.path.abspath(store_dir)
         os.makedirs(self.store_dir, exist_ok=True)
         self.sandbox = SandboxWorld(sandbox_root or os.path.join(self.store_dir, "sandbox"))
         self.policy = approval_policy or AllowReadOnly()
+        self.store = SessionStore(self.store_dir)
+        self.logger = logger or default_logger
         self.runtimes = {}
         self.sessions = {}
 
@@ -127,7 +133,59 @@ class Host:
             delegation_depth=delegation_depth,
         )
         self.sessions[session.id] = session
+        session._sync_metadata()
         return session
+
+    def get_session(self, session_id):
+        return self.sessions.get(session_id)
+
+    def list_sessions(self):
+        return self.store.list_sessions()
+
+    def resume_session(self, session_id, runtime_id=None):
+        if session_id in self.sessions:
+            session = self.sessions[session_id]
+            if runtime_id and runtime_id != session.runtime_id:
+                session.switch_runtime(runtime_id, reason="resume_rebind")
+            return session
+
+        meta = self.store.get_metadata(session_id)
+        if not meta:
+            meta = self.store.rebuild_metadata_from_log(session_id)
+
+        session = Session(
+            host=self,
+            session_id=session_id,
+            preset=meta.preset,
+            parent_id=meta.parent_id,
+            delegation_depth=meta.delegation_depth,
+        )
+        session.log.reload()
+        session.turn_no = meta.turn_count
+        session.epoch = meta.epoch
+
+        bind_target = runtime_id or meta.current_runtime or "native"
+        if bind_target in self.runtimes:
+            session.bind(bind_target, reason="resume")
+
+        # The fresh rebind appended its own events on top of the
+        # metadata snapshot, so re-sync the manifest before handing the
+        # session back.
+        session._sync_metadata()
+        self.sessions[session_id] = session
+        return session
+
+    def attach_signal_handlers(self):
+        def _handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, shutting down sessions...")
+            self.stop_all()
+            sys.exit(0)
+
+        try:
+            signal.signal(signal.SIGINT, _handler)
+            signal.signal(signal.SIGTERM, _handler)
+        except (ValueError, AttributeError):
+            pass
 
     def stop_all(self):
         for session in list(self.sessions.values()):
@@ -153,11 +211,32 @@ class Session:
         self.turn_open = False
         self.provider = None
         self.runtime_id = None
+        self._last_runtime_id = None
         self.effective_caps = {}
         self._sink = None
         self._buffer = None
         self._pending_tool = None
         self._lock = threading.RLock()
+
+    def _sync_metadata(self):
+        try:
+            created_at = self.log.events[0].ts if self.log.events else time.time()
+            updated_at = self.log.events[-1].ts if self.log.events else time.time()
+            meta = SessionMetadata(
+                session_id=self.id,
+                preset=self.preset,
+                parent_id=self.parent_id,
+                delegation_depth=self.delegation_depth,
+                current_runtime=self.runtime_id or self._last_runtime_id,
+                epoch=self.epoch,
+                turn_count=self.turn_no,
+                event_count=len(self.log.events),
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+            self.host.store.record_session(meta)
+        except Exception:
+            pass
 
     # ---- bind / rebind ----
     def bind(self, runtime_id, reason="initial", extra_required=()):
@@ -167,6 +246,7 @@ class Session:
             for kind, payload, rt, epoch in events:
                 self.log.append(kind, payload, runtime_id=rt, epoch=epoch)
             failure = [e for e in events if e[0] == "runtime/bind-failed"]
+            self._sync_metadata()
             if failure:
                 raise HarnessError(failure[0][1]["errorCode"], failure[0][1]["message"])
 
@@ -232,6 +312,7 @@ class Session:
         }, runtime_id, self.epoch))
         self.provider = provider
         self.runtime_id = runtime_id
+        self._last_runtime_id = runtime_id
         self.effective_caps = eff
         return out
 
@@ -276,6 +357,7 @@ class Session:
             }, None, self.epoch)
             for kind, payload, rt, epoch in events:
                 self.log.append(kind, payload, runtime_id=rt, epoch=self.epoch)
+            self._sync_metadata()
             try:
                 old_provider.stop()
             except HarnessError:
@@ -372,6 +454,7 @@ class Session:
                     }, self.runtime_id, self.epoch)
             finally:
                 self.turn_open = False
+                self._sync_metadata()
 
 
 
@@ -476,6 +559,7 @@ class Session:
                 self.provider = None
                 self.runtime_id = None
             self.log.close()
+            self._sync_metadata()
 
     # ---- cancellation / shutdown ----
     def cancel(self):

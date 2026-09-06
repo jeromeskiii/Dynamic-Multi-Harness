@@ -9,6 +9,9 @@ from .errors import HarnessError
 from .provider import HarnessProvider, StreamItem
 from .capabilities import effective as effective_capabilities
 from .host import Host, RuntimeSpec
+from .persistence import SessionMetadata, SessionStore
+from .telemetry import TelemetryLogger, default_logger, redact_secrets
+from .server import DMHProtocolServer
 from . import ev1h_runtime, cognihak_runtime, qwen_runtime
 
 __version__ = "0.1.0"
@@ -19,6 +22,12 @@ __all__ = [
     "Host",
     "RuntimeSpec",
     "StreamItem",
+    "SessionMetadata",
+    "SessionStore",
+    "TelemetryLogger",
+    "default_logger",
+    "redact_secrets",
+    "DMHProtocolServer",
     "effective_capabilities",
     "ev1h_runtime",
     "cognihak_runtime",

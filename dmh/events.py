@@ -110,6 +110,9 @@ class SessionLog:
                 pass
             self._fh = None
 
+    def __del__(self):
+        self.close()
+
     def append(self, kind, payload=None, runtime_id=None, epoch=0):
         if kind not in KNOWN_KINDS:
             raise ValueError(f"unknown event kind: {kind!r}")
